@@ -90,9 +90,37 @@ class CheckpointFileHf(_CheckpointHf):
     @override
     def _download(self) -> str:
         """Download checkpoint and return the local path."""
+        # If filename itself is a local path (absolute or relative to cwd), use it.
+        if os.path.isabs(self.filename) and os.path.exists(self.filename):
+            log.info(f"Using local absolute path for checkpoint: {self.filename}")
+            return self.filename
+        rel_path = os.path.abspath(os.path.join(os.getcwd(), self.filename))
+        if os.path.exists(rel_path):
+            log.info(f"Using local relative path for checkpoint: {rel_path}")
+            return rel_path
+
+        # Also check project-local checkpoint directory: ./checkpoint/<repo_id>/<filename>
+        project_checkpoint = os.path.abspath(os.path.join(os.getcwd(), "checkpoints", self.repository, self.filename))
+        if os.path.exists(project_checkpoint):
+            log.info(f"Found checkpoint in project checkpoint dir: {project_checkpoint}")
+            return project_checkpoint
+
         download_kwargs = dict(
             repo_id=self.repository, repo_type="model", revision=self.revision, filename=self.filename
         )
+
+        # Try to find the file in the local HF cache first (no network).
+        try:
+            log.info(f"Checking Hugging Face local cache for {download_kwargs}")
+            path = hf_hub_download(local_files_only=True, **download_kwargs)
+            if os.path.exists(path):
+                log.info(f"Found cached checkpoint at {path}")
+                return path
+        except Exception:
+            # local_files_only may raise if not present in cache; fall through to download
+            log.info("Checkpoint not found in local cache; will download from Hugging Face")
+
+        # Fallback: download from HF hub (network)
         log.info(f"Downloading checkpoint file from Hugging Face with {download_kwargs}")
         path = hf_hub_download(**download_kwargs)
         assert os.path.exists(path), path
@@ -125,16 +153,43 @@ class CheckpointDirHf(_CheckpointHf):
             patterns["allow_patterns"] = ["*"]
         if self.exclude:
             patterns["ignore_patterns"] = list(self.exclude)
+        # If a subdirectory is specified, prefix the patterns so local cache lookup matches layout
         if self.subdirectory:
             patterns = {key: [os.path.join(self.subdirectory, x) for x in val] for key, val in patterns.items()}
+
         download_kwargs = dict(repo_id=self.repository, repo_type="model", revision=self.revision) | patterns
+
+        # 1) Check for a project-local checkpoint directory: ./checkpoints/<repo_id>[/<subdirectory>]
+        project_checkpoint = (
+            os.path.abspath(os.path.join(os.getcwd(), "checkpoints", self.repository, self.subdirectory))
+            if self.subdirectory
+            else os.path.abspath(os.path.join(os.getcwd(), "checkpoints", self.repository))
+        )
+        if os.path.exists(project_checkpoint):
+            log.info(f"Found checkpoint in project checkpoint dir: {project_checkpoint}")
+            return project_checkpoint
+
+        # 2) Try the Hugging Face local cache (no network). snapshot_download supports local_files_only.
+        try:
+            log.info(f"Checking Hugging Face local cache for {download_kwargs}")
+            path = snapshot_download(local_files_only=True, **download_kwargs)
+            # If snapshot_download returned a root repo path, append subdirectory if needed
+            if self.subdirectory:
+                path = os.path.join(path, self.subdirectory)
+            if os.path.exists(path):
+                log.info(f"Found cached checkpoint at {path}")
+                return path
+        except Exception:
+            # local_files_only may raise if nothing is present in the cache; fall through to network download
+            log.info("Checkpoint not found in local Hugging Face cache; will download from Hugging Face")
+
+        # 3) Fallback: download from HF hub (network)
         log.info(f"Downloading checkpoint from Hugging Face with {download_kwargs}")
         path = snapshot_download(**download_kwargs)
         if self.subdirectory:
             path = os.path.join(path, self.subdirectory)
         assert os.path.exists(path), path
         return path
-
 
 class CheckpointConfig(pydantic.BaseModel):
     """Config for checkpoint."""

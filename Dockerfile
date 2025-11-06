@@ -38,7 +38,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
 
 # Install uv: https://docs.astral.sh/uv/getting-started/installation/
 # https://github.com/astral-sh/uv-docker-example/blob/main/Dockerfile
-COPY --from=ghcr.io/astral-sh/uv:0.8.12 /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.8.12 /uv /uvx /usr/local/bin//
 # Enable bytecode compilation
 ENV UV_COMPILE_BYTECODE=1
 # Copy from the cache instead of linking since it's a mounted volume
@@ -47,8 +47,11 @@ ENV UV_LINK_MODE=copy
 ENV UV_TOOL_BIN_DIR=/usr/local/bin
 
 # Install just: https://just.systems/man/en/pre-built-binaries.html
-RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin --tag 1.42.4
-
+# RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin --tag 1.42.4
+RUN curl -L -o /usr/local/bin/just https://ghproxy.cn/https://github.com/casey/just/releases/download/1.42.4/just-1.42.4-x86_64-unknown-linux-musl.tar.gz && \
+    tar -xzf /usr/local/bin/just -C /usr/local/bin/ || true && \
+    chmod +x /usr/local/bin/just
+    
 WORKDIR /workspace
 
 # Install the project's dependencies using the lockfile and settings
@@ -56,7 +59,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     --mount=type=bind,source=.python-version,target=.python-version \
-    --mount=type=bind,source=packages,target=packages \
+    --mount=type=bind,source=packages/cosmos-gradio/pyproject.toml,target=packages/cosmos-gradio/pyproject.toml \
     uv sync --locked --no-install-project
 
 # Place executables in the environment at the front of the path
