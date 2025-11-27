@@ -73,6 +73,14 @@ class TextEncoder:
         log.info("Instantiating text encoder model...")
         with torch.device("meta"):
             self.model = lazy_instantiate(self.config.model_config)
+            
+        # Dump structured model architecture and parameter counts to a markdown file.
+        out_dir = os.path.abspath(os.path.join(os.getcwd(), "outputs", "network_arch"))
+        os.makedirs(out_dir, exist_ok=True)
+        out_file = os.path.join(out_dir, "text_encoder.md")
+        with open(out_file, "w") as f:
+            f.write(repr(self.model))
+        
         self.model.to_empty(device=self.device)
         with torch.no_grad():
             self.model.init_weights()

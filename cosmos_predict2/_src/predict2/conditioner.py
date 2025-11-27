@@ -24,6 +24,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, TypeVar, Union
 
 import omegaconf
+import inspect
 import torch
 import torch.nn as nn
 from torch.distributed import ProcessGroup
@@ -416,6 +417,14 @@ class GeneralConditioner(nn.Module, ABC):
     def __init__(self, **emb_models: Union[List, Any]):
         super().__init__()
         self.embedders = nn.ModuleDict()
+        
+        import os
+        out_dir = os.path.abspath(os.path.join(os.getcwd(), "outputs", "network_arch"))
+        os.makedirs(out_dir, exist_ok=True)
+        out_file = os.path.join(out_dir, "embedders.md")
+        # Ensure the file exists and is empty before the loop; we'll append per-embedder info inside the loop.
+        open(out_file, "w").close()
+        
         for n, (emb_name, emb_config) in enumerate(emb_models.items()):
             embedder = instantiate(emb_config)
             assert isinstance(embedder, AbstractEmbModel), (
@@ -429,9 +438,31 @@ class GeneralConditioner(nn.Module, ABC):
                     param.requires_grad = False
                 embedder.eval()
 
-            log.info(f"Initialized embedder #{n}-{emb_name}: \n {embedder.summary()}")
+            log.debug(f"Initialized embedder #{n}-{emb_name}: \n {embedder.summary()}")
             self.embedders[emb_name] = embedder
+            
+            # Append this embedder's info so previous entries are preserved during the loop.
+            with open(out_file, "a") as f:
+                f.write((embedder.input_key if isinstance(embedder.input_key, str) else str(embedder.input_key)) + "\n")
+                f.write(repr(embedder) + "\n\n")
 
+            # Runtime inspect: try to record where this embedder class and its forward() are defined
+            try:
+                cls = embedder.__class__
+                src_file = inspect.getsourcefile(cls) or inspect.getfile(cls)
+                _, src_line = inspect.getsourcelines(cls)
+                log.debug(f"Embedder init: name={emb_name} class={cls.__module__}.{cls.__name__} file={src_file} line={src_line}")
+            except Exception as e:
+                log.debug(f"Embedder init: name={emb_name} class={embedder.__class__.__module__}.{embedder.__class__.__name__} (inspect failed: {e})")
+
+            try:
+                f_src = inspect.getsourcefile(embedder.forward) or inspect.getfile(embedder.forward)
+                _, f_lineno = inspect.getsourcelines(embedder.forward)
+                log.debug(f"  forward defined in {f_src} line {f_lineno}")
+            except Exception:
+                # forward may be a builtin or C extension
+                pass
+            
     @abstractmethod
     def forward(
         self,
@@ -462,6 +493,23 @@ class GeneralConditioner(nn.Module, ABC):
             In case the network code is sensitive to the order of concatenation, you can either control the order via \
             config file or make sure the embedders return a unique key for each output.
         """
+        
+        # Debug: print each batch key and the value's dimensions / type for easier inspection
+        try:
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    log.debug(f"batch key={k} shape={tuple(v.shape)} dtype={v.dtype} device={v.device}")
+                elif isinstance(v, (list, tuple)):
+                    # If it's a list/tuple, log length and any tensor shapes inside
+                    log.debug(f"batch key={k} type={type(v)} len={len(v)}")
+                    for i, item in enumerate(v):
+                        if isinstance(item, torch.Tensor):
+                            log.debug(f"  - element[{i}] shape={tuple(item.shape)} dtype={item.dtype} device={item.device}")
+                else:
+                    log.debug(f"batch key={k} type={type(v)} repr={repr(v)[:200]}")
+        except Exception as e:
+            log.warning(f"Failed to introspect batch contents for shapes: {e}")
+
         output = defaultdict(list)
         if override_dropout_rate is None:
             override_dropout_rate = {}
@@ -471,15 +519,18 @@ class GeneralConditioner(nn.Module, ABC):
             assert emb_name in self.embedders, f"invalid name found {emb_name}"
 
         for emb_name, embedder in self.embedders.items():
+            log.debug(f"Conditioner processing embedder: emb_name={emb_name}, embedder.input_key={embedder.input_key}")
             embedding_context = nullcontext if embedder.is_trainable else torch.no_grad
             with embedding_context():
                 if isinstance(embedder.input_key, str):
+                    log.debug(f"embedder.input_key is string: {embedder.input_key}")
                     emb_out = embedder(
                         embedder.random_dropout_input(
                             batch[embedder.input_key], override_dropout_rate.get(emb_name, None)
                         )
                     )
                 elif isinstance(embedder.input_key, (list, omegaconf.listconfig.ListConfig)):
+                    log.debug(f"embedder.input_key is list: {embedder.input_key}")
                     emb_out = embedder(
                         *[
                             embedder.random_dropout_input(batch.get(k), override_dropout_rate.get(emb_name, None), k)
@@ -524,6 +575,7 @@ class GeneralConditioner(nn.Module, ABC):
 
         condition: Any = self(data_batch, override_dropout_rate=cond_dropout_rates)
         un_condition: Any = self(data_batch, override_dropout_rate=dropout_rates)
+        
         return condition, un_condition
 
     def get_condition_with_negative_prompt(
@@ -547,8 +599,11 @@ class GeneralConditioner(nn.Module, ABC):
             if isinstance(data_batch_neg_prompt["neg_t5_text_embeddings"], torch.Tensor):
                 data_batch_neg_prompt["t5_text_embeddings"] = data_batch_neg_prompt["neg_t5_text_embeddings"]
 
+        # log.info(f"Getting condition...")
         condition: Any = self(data_batch, override_dropout_rate=cond_dropout_rates)
+        # log.info(f"Getting un_condition...")
         un_condition: Any = self(data_batch_neg_prompt, override_dropout_rate=uncond_dropout_rates)
+        # _log_summary("un_condition", un_condition)
 
         return condition, un_condition
 

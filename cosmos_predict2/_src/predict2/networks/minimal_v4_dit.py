@@ -773,7 +773,9 @@ class TimestepEmbedding(nn.Module):
         emb = self.activation(emb)
         emb = self.linear_2(emb)
 
+        log.debug(f"t_embedder-TimestepEmbedding forward self.use_adaln_lora={self.use_adaln_lora}")
         if self.use_adaln_lora:
+            # this branch
             adaln_lora_B_T_3D = emb
             emb_B_T_D = sample
         else:
@@ -964,6 +966,7 @@ class FinalLayer(nn.Module):
         emb_B_T_D,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
     ):
+        log.debug("In final_layer...")
         if self.use_wan_fp32_strategy:
             assert emb_B_T_D.dtype == torch.float32
         with amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
@@ -972,6 +975,7 @@ class FinalLayer(nn.Module):
                 shift_B_T_D, scale_B_T_D = (
                     self.adaln_modulation(emb_B_T_D) + adaln_lora_B_T_3D[:, :, : 2 * self.hidden_size]
                 ).chunk(2, dim=-1)
+                log.debug(f"shift_B_T_D.shape={shift_B_T_D.shape}, scale_B_T_D.shape={scale_B_T_D.shape}")
             else:
                 shift_B_T_D, scale_B_T_D = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
 
@@ -979,14 +983,17 @@ class FinalLayer(nn.Module):
                 rearrange(shift_B_T_D, "b t d -> b t 1 1 d"),
                 rearrange(scale_B_T_D, "b t d -> b t 1 1 d"),
             )
+            log.debug(f"shift_B_T_1_1_D.shape={shift_B_T_1_1_D.shape}, scale_B_T_1_1_D.shape={scale_B_T_1_1_D.shape}")
 
             def _fn(_x_B_T_H_W_D, _norm_layer, _scale_B_T_1_1_D, _shift_B_T_1_1_D):
                 return _norm_layer(_x_B_T_H_W_D) * (1 + _scale_B_T_1_1_D) + _shift_B_T_1_1_D
 
             x_B_T_H_W_D = _fn(x_B_T_H_W_D, self.layer_norm, scale_B_T_1_1_D, shift_B_T_1_1_D)
+            log.debug(f"x_B_T_H_W_D.shape after adaln: {x_B_T_H_W_D.shape}")
             x_B_T_H_W_O = self.linear(
                 x_B_T_H_W_D
             )  # O = spatial_patch_size * spatial_patch_size * temporal_patch_size * out_channels
+            log.debug(f"x_B_T_H_W_O.shape after linear: {x_B_T_H_W_O.shape}")
         return x_B_T_H_W_O
 
 
@@ -1128,8 +1135,10 @@ class Block(nn.Module):
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
+        log.debug(f"In block...")
         with amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
             if self.use_adaln_lora:
+                # this branch
                 shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
                     self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
                 ).chunk(3, dim=-1)
@@ -1139,6 +1148,10 @@ class Block(nn.Module):
                 shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
                     self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
                 ).chunk(3, dim=-1)
+                log.debug(f"After adaln_lora addition...")
+                log.debug(f"shift_self_attn_B_T_D.shape={shift_self_attn_B_T_D.shape}, scale_self_attn_B_T_D.shape={scale_self_attn_B_T_D.shape}, gate_self_attn_B_T_D.shape={gate_self_attn_B_T_D.shape}")
+                log.debug(f"shift_cross_attn_B_T_D.shape={shift_cross_attn_B_T_D.shape}, scale_cross_attn_B_T_D.shape={scale_cross_attn_B_T_D.shape}, gate_cross_attn_B_T_D.shape={gate_cross_attn_B_T_D.shape}")
+                log.debug(f"shift_mlp_B_T_D.shape={shift_mlp_B_T_D.shape}, scale_mlp_B_T_D.shape={scale_mlp_B_T_D.shape}, gate_mlp_B_T_D.shape={gate_mlp_B_T_D.shape}")
             else:
                 shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = self.adaln_modulation_self_attn(
                     emb_B_T_D
@@ -1161,6 +1174,11 @@ class Block(nn.Module):
         scale_mlp_B_T_1_1_D = rearrange(scale_mlp_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
         gate_mlp_B_T_1_1_D = rearrange(gate_mlp_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
 
+        log.debug(f"After reshaping...")
+        log.debug(f"shift_self_attn_B_T_1_1_D.shape={shift_self_attn_B_T_1_1_D.shape}, scale_self_attn_B_T_1_1_D.shape={scale_self_attn_B_T_1_1_D.shape}, gate_self_attn_B_T_1_1_D.shape={gate_self_attn_B_T_1_1_D.shape}")
+        log.debug(f"shift_cross_attn_B_T_1_1_D.shape={shift_cross_attn_B_T_1_1_D.shape}, scale_cross_attn_B_T_1_1_D.shape={scale_cross_attn_B_T_1_1_D.shape}, gate_cross_attn_B_T_1_1_D.shape={gate_cross_attn_B_T_1_1_D.shape}")
+        log.debug(f"shift_mlp_B_T_1_1_D.shape={shift_mlp_B_T_1_1_D.shape}, scale_mlp_B_T_1_1_D.shape={scale_mlp_B_T_1_1_D.shape}, gate_mlp_B_T_1_1_D.shape={gate_mlp_B_T_1_1_D.shape}")
+
         B, T, H, W, D = x_B_T_H_W_D.shape
 
         def _fn(_x_B_T_H_W_D, _norm_layer, _scale_B_T_1_1_D, _shift_B_T_1_1_D):
@@ -1172,6 +1190,7 @@ class Block(nn.Module):
             scale_self_attn_B_T_1_1_D,
             shift_self_attn_B_T_1_1_D,
         )
+        log.debug(f"normalized_x_B_T_H_W_D.shape={normalized_x_B_T_H_W_D.shape}")
 
         video_size = VideoSize(T=T, H=H, W=W)
 
@@ -1196,7 +1215,9 @@ class Block(nn.Module):
             h=H,
             w=W,
         )
+        log.debug(f"After self-attention: result_B_T_H_W_D.shape={result_B_T_H_W_D.shape}")
         x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D * result_B_T_H_W_D
+        log.debug(f"After self-attention: x_B_T_H_W_D.shape={x_B_T_H_W_D.shape}")
 
         def _x_fn(
             _x_B_T_H_W_D,
@@ -1229,7 +1250,9 @@ class Block(nn.Module):
             shift_cross_attn_B_T_1_1_D,
             gate_cross_attn_B_T_1_1_D,
         )
+        log.debug(f"After cross-attention: result_B_T_H_W_D.shape={result_B_T_H_W_D.shape}")
         x_B_T_H_W_D = result_B_T_H_W_D * gate_cross_attn_B_T_1_1_D + x_B_T_H_W_D
+        log.debug(f"After cross-attention: x_B_T_H_W_D.shape={x_B_T_H_W_D.shape}")
 
         normalized_x_B_T_H_W_D = _fn(
             x_B_T_H_W_D,
@@ -1539,22 +1562,30 @@ class MiniTrainDIT(WeightTrainingStat):
             `self.pos_embedder` with the fps tensor.
             - Otherwise, the positional embeddings are generated without considering fps.
         """
+        log.debug("Preparing embedded sequence...")
+        log.debug(f"fps.shape={fps.shape}, self.concat_padding_mask={self.concat_padding_mask}, self.extra_per_block_abs_pos_emb={self.extra_per_block_abs_pos_emb}, [rope] in self.pos_emb_cls.lower(): {'rope' in self.pos_emb_cls.lower()}")
         if self.concat_padding_mask:
+            # this branch
             padding_mask = transforms.functional.resize(
                 padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
             )
             x_B_C_T_H_W = torch.cat(
                 [x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1
             )
+        log.debug(f"Before self.x_embedder: x_B_C_T_H_W.shape={x_B_C_T_H_W.shape}")
         x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)
+        log.debug(f"After self.x_embedder: x_B_T_H_W_D.shape={x_B_T_H_W_D.shape}")
 
         if self.extra_per_block_abs_pos_emb:
             extra_pos_emb = self.extra_pos_embedder(x_B_T_H_W_D, fps=fps)
         else:
+            # this branch
             extra_pos_emb = None
 
         if "rope" in self.pos_emb_cls.lower():
+            # this branch
             return x_B_T_H_W_D, self.pos_embedder(x_B_T_H_W_D, fps=fps), extra_pos_emb
+        
         x_B_T_H_W_D = x_B_T_H_W_D + self.pos_embedder(x_B_T_H_W_D)  # [B, T, H, W, D]
 
         return x_B_T_H_W_D, None, extra_pos_emb

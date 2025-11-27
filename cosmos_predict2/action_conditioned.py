@@ -25,7 +25,8 @@ import mediapy
 import numpy as np
 import torch
 import torchvision
-from loguru import logger
+from cosmos_predict2._src.imaginaire.utils import log
+from cosmos_predict2._src.imaginaire.utils.profiling import maybe_enable_profiling_inference        
 
 from cosmos_predict2._src.imaginaire.utils import distributed
 from cosmos_predict2._src.predict2.action.datasets.dataset_utils import euler2rotm, rotm2euler, rotm2quat
@@ -171,7 +172,7 @@ def load_default_action_fn():
                 h, w = map(int, args.resolution.split(","))
                 img_array = mediapy.resize_image(img_array, (h, w))
             except Exception as e:
-                logger.warning(f"Failed to resize image to {args.resolution}: {e}")
+                log.warning(f"Failed to resize image to {args.resolution}: {e}")
 
         return {
             "actions": actions,
@@ -208,7 +209,7 @@ def inference(
 ):
     """Run action-conditioned video generation inference using resolved setup and per-run arguments."""
     torch.enable_grad(False)  # Disable gradient calculations for inference
-
+    
     # Validate num_latent_conditional_frames at the very beginning
     if inference_args.num_latent_conditional_frames not in [0, 1, 2]:
         raise ValueError(
@@ -232,9 +233,9 @@ def inference(
                 f"{set(os.path.splitext(f)[1].lower() for f in os.listdir(inference_args.input_root) if os.path.splitext(f)[1])}"
             )
 
-        logger.info(f"Using video-only mode with {inference_args.num_latent_conditional_frames} conditional frames")
+            log.info(f"Using video-only mode with {inference_args.num_latent_conditional_frames} conditional frames")
     elif inference_args.num_latent_conditional_frames == 1:
-        logger.info(f"Using image+video mode with {inference_args.num_latent_conditional_frames} conditional frame")
+        log.info(f"Using image+video mode with {inference_args.num_latent_conditional_frames} conditional frame")
 
     # Get checkpoint and experiment from setup args
     checkpoint = MODEL_CHECKPOINTS[setup_args.model_key]
@@ -257,7 +258,7 @@ def inference(
     )
 
     mem_bytes = torch.cuda.memory_allocated(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    logger.info(f"GPU memory usage after model load: {mem_bytes / (1024**3):.2f} GB")
+    log.info(f"GPU memory usage after model load: {mem_bytes / (1024**3):.2f} GB")
 
     # Load action loading function
     action_load_fn = load_callable(inference_args.action_load_fn)
@@ -276,100 +277,119 @@ def inference(
     # Ensure save directory exists
     inference_args.save_root.mkdir(parents=True, exist_ok=True)
 
-    # Process each file in the input directory
-    for annotation_path in input_json_list[inference_args.start : inference_args.end]:
-        with open(annotation_path, "r") as f:
-            json_data = json.load(f)
+    log.info("Instantiation completed. Starting inference...")
+    
+    with maybe_enable_profiling_inference(inference_args, trace_handler_kind="tensorboard") as torch_profiler:
+        # Process each file in the input directory
+        for ann_idx, annotation_path in enumerate(
+            input_json_list[inference_args.start : inference_args.end], start=inference_args.start
+        ):
+            # Log which annotation (index and path) we're processing for easier debugging/tracing
+            # log.info(f"Processing annotation #{ann_idx}: {annotation_path}")
 
-        # Convert camera_id to integer if it's a string and can be converted to an integer
-        camera_id = (
-            int(inference_args.camera_id)
-            if isinstance(inference_args.camera_id, str) and inference_args.camera_id.isdigit()
-            else inference_args.camera_id
-        )
+            with open(annotation_path, "r") as f:
+                json_data = json.load(f)
 
-        if isinstance(json_data["videos"][camera_id], dict):
-            video_path = str(input_video_path / json_data["videos"][camera_id]["video_path"])
-        else:
-            video_path = str(input_video_path / json_data["videos"][camera_id])
-
-        # Load action data using the configured function
-        action_data = action_load_fn()(json_data, video_path, inference_args)
-        actions = action_data["actions"]
-        img_array = action_data["initial_frame"]
-
-        img_name = annotation_path.split("/")[-1].split(".")[0]
-
-        frames = [img_array]
-        chunk_video = []
-
-        video_name = str(inference_args.save_root / f"{img_name.replace('.jpg', '.mp4')}")
-        chunk_video_name = str(inference_args.save_root / f"{img_name}_chunk.mp4")
-        logger.info(f"Saving video to {video_name}")
-        if os.path.exists(chunk_video_name):
-            logger.info(f"Video already exists: {chunk_video_name}")
-            continue
-
-        for i in range(inference_args.start_frame_idx, len(actions), inference_args.chunk_size):
-            # Handle incomplete chunks
-            actions_chunk = actions[i : i + inference_args.chunk_size]
-            if actions_chunk.shape[0] != inference_args.chunk_size:
-                pad_len = inference_args.chunk_size - actions_chunk.shape[0]
-                if pad_len > 0:
-                    action_shape = list(actions.shape[1:])
-                    pad_shape = [pad_len] + action_shape
-                    pad_actions = np.zeros(pad_shape, dtype=actions.dtype)
-                    actions_chunk = np.concatenate([actions_chunk, pad_actions], axis=0)
-
-            # Convert img_array to tensor and prepare video input
-            # pyrefly: ignore  # implicit-import
-            img_tensor = torchvision.transforms.functional.to_tensor(img_array).unsqueeze(0)
-            num_video_frames = actions_chunk.shape[0] + 1
-            vid_input = torch.cat(
-                [img_tensor, torch.zeros_like(img_tensor).repeat(num_video_frames - 1, 1, 1, 1)], dim=0
+            # Convert camera_id to integer if it's a string and can be converted to an integer
+            camera_id = (
+                int(inference_args.camera_id)
+                if isinstance(inference_args.camera_id, str) and inference_args.camera_id.isdigit()
+                else inference_args.camera_id
             )
-            vid_input = (vid_input * 255.0).to(torch.uint8)
-            vid_input = vid_input.unsqueeze(0).permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
 
-            # Call generate_vid2world
-            video = video2world_cli.generate_vid2world(
-                prompt=inference_args.prompt or "",
-                input_path=vid_input,
-                action=torch.from_numpy(actions_chunk).float()
-                if isinstance(actions_chunk, np.ndarray)
-                else actions_chunk,
-                guidance=inference_args.guidance,
-                num_video_frames=num_video_frames,
-                num_latent_conditional_frames=inference_args.num_latent_conditional_frames,
-                resolution=inference_args.resolution,
-                seed=i,
-                negative_prompt=inference_args.negative_prompt,
-            )
-            # Extract next frame and video from result
-            video_normalized = (video - (-1)) / (1 - (-1))
-            video_clamped = (
-                (torch.clamp(video_normalized[0], 0, 1) * 255).to(torch.uint8).permute(1, 2, 3, 0).cpu().numpy()
-            )
-            next_img_array = video_clamped[-1]  # Last frame is the next frame
-            frames.append(next_img_array)
-            img_array = next_img_array
-            chunk_video.append(video_clamped)
+            if isinstance(json_data["videos"][camera_id], dict):
+                video_path = str(input_video_path / json_data["videos"][camera_id]["video_path"])
+            else:
+                video_path = str(input_video_path / json_data["videos"][camera_id])
 
-            if inference_args.single_chunk:
-                break
+            # Load action data using the configured function
+            action_data = action_load_fn()(json_data, video_path, inference_args)
+            actions = action_data["actions"]
+            img_array = action_data["initial_frame"]
 
-        chunk_list = [chunk_video[0]] + [
-            chunk_video[i][: inference_args.chunk_size] for i in range(1, len(chunk_video))
-        ]
-        chunk_video = np.concatenate(chunk_list, axis=0)
-        if inference_args.single_chunk:
-            chunk_video_name = str(inference_args.save_root / f"{img_name}_single_chunk.mp4")
-        else:
+            img_name = annotation_path.split("/")[-1].split(".")[0]
+
+            frames = [img_array]
+            chunk_video = []
+
+            video_name = str(inference_args.save_root / f"{img_name.replace('.jpg', '.mp4')}")
             chunk_video_name = str(inference_args.save_root / f"{img_name}_chunk.mp4")
+            log.info(f"Saving video to {video_name}")
+            if os.path.exists(chunk_video_name):
+                log.info(f"Video already exists: {chunk_video_name}")
+                continue
 
-        if rank0:
-            mediapy.write_video(chunk_video_name, chunk_video, fps=inference_args.save_fps)
-            logger.info(f"Saved video to {chunk_video_name}")
+            for i in range(inference_args.start_frame_idx, len(actions), inference_args.chunk_size):
+                # Log chunk start index for easier tracing
+                # log.info(f"Processing chunk starting at index {i}")
+                # Handle incomplete chunks
+                actions_chunk = actions[i : i + inference_args.chunk_size]
+                if actions_chunk.shape[0] != inference_args.chunk_size:
+                    pad_len = inference_args.chunk_size - actions_chunk.shape[0]
+                    if pad_len > 0:
+                        action_shape = list(actions.shape[1:])
+                        pad_shape = [pad_len] + action_shape
+                        pad_actions = np.zeros(pad_shape, dtype=actions.dtype)
+                        actions_chunk = np.concatenate([actions_chunk, pad_actions], axis=0)
+
+                # Convert img_array to tensor and prepare video input
+                # pyrefly: ignore  # implicit-import
+                img_tensor = torchvision.transforms.functional.to_tensor(img_array).unsqueeze(0)
+                # since action means the change to next frame, N actions correspond to N+1 frames
+                num_video_frames = actions_chunk.shape[0] + 1
+                vid_input = torch.cat(
+                    [img_tensor, torch.zeros_like(img_tensor).repeat(num_video_frames - 1, 1, 1, 1)], dim=0
+                )
+                vid_input = (vid_input * 255.0).to(torch.uint8)
+                vid_input = vid_input.unsqueeze(0).permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
+
+                log.info(f"Pre-process completed. Processing video chunk start i={i}, vid_input.shape={vid_input.shape}, actions_chunk.shape={actions_chunk.shape}")
+                
+                # Call generate_vid2world
+                video = video2world_cli.generate_vid2world(
+                    prompt=inference_args.prompt or "",
+                    input_path=vid_input,
+                    action=torch.from_numpy(actions_chunk).float()
+                    if isinstance(actions_chunk, np.ndarray)
+                    else actions_chunk,
+                    guidance=inference_args.guidance,
+                    num_video_frames=num_video_frames,
+                    num_latent_conditional_frames=inference_args.num_latent_conditional_frames,
+                    resolution=inference_args.resolution,
+                    seed=i,
+                    negative_prompt=inference_args.negative_prompt,
+                )
+
+                log.info(f"Finished video chunk generation, video.shape={video.shape}")
+
+                # Extract next frame and video from result
+                video_normalized = (video - (-1)) / (1 - (-1))
+                video_clamped = (
+                    (torch.clamp(video_normalized[0], 0, 1) * 255).to(torch.uint8).permute(1, 2, 3, 0).cpu().numpy()
+                )
+                next_img_array = video_clamped[-1]  # Last frame is the next frame
+                frames.append(next_img_array)
+                img_array = next_img_array
+                chunk_video.append(video_clamped)
+
+                if inference_args.single_chunk:
+                    break
+                
+                if torch_profiler:
+                    torch_profiler.step()
+
+            chunk_list = [chunk_video[0]] + [
+                chunk_video[i][: inference_args.chunk_size] for i in range(1, len(chunk_video))
+            ]
+            chunk_video = np.concatenate(chunk_list, axis=0)
+            if inference_args.single_chunk:
+                chunk_video_name = str(inference_args.save_root / f"{img_name}_single_chunk.mp4")
+            else:
+                chunk_video_name = str(inference_args.save_root / f"{img_name}_chunk.mp4")
+
+            if rank0:
+                mediapy.write_video(chunk_video_name, chunk_video, fps=inference_args.save_fps)
+                log.info(f"Saved video to {chunk_video_name}")
 
     # Synchronize all processes before cleanup
     # pyrefly: ignore  # unsupported-operation

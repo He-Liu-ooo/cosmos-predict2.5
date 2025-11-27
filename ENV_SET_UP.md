@@ -70,10 +70,15 @@ Helpful Docker commands
 
 ```bash
 # List running containers
-docker ps
+docker ps [-a]
 
 # Exec into an existing container
-docker exec -it <container-id> /bin/bash
+docker start cosmos-predict25-container
+docker exec -it cosmos-predict25-container bash
+source .venv/bin/activate
+exit
+docker exec -it cosmos-predict25-container bash
+# if no docker exec, and you exit directly after docker start, this means the container is no longer running, and the installation you made in the container no longer holds
 
 # Stop a container by name
 docker stop cosmos-predict25-container
@@ -96,13 +101,9 @@ After downloading, you can mount the repository and the `checkpoints/` directory
 6) Run an example (inside container or host Python)
 
 ```bash
+source .venv/bin/activate
+
 python examples/action_conditioned.py \
   -i assets/action_conditioned/basic/inference_params.json \
   -o outputs/action_conditioned/basic
 ```
-
-Notes
-- If you prefer to download checkpoints inside the container, the code will fall back to the Hugging Face hub when a local copy is not found.
-- If you see issues with CUDA drivers or `torch` binaries, confirm the container image CUDA/toolkit variants match your host drivers.
-
-If you want, I can also add a short `docker-compose.yml` for easier local runs, or modify the `checkpoint_db.py` to look for specific `.pt` files first — say the word and I will do it.

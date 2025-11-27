@@ -773,6 +773,12 @@ class WanVAE:
             device=device,
             temporal_window=temporal_window,
         )
+        import os
+        out_dir = os.path.abspath(os.path.join(os.getcwd(), "outputs", "network_arch"))
+        os.makedirs(out_dir, exist_ok=True)
+        out_file = os.path.join(out_dir, "video_tokenizer.md")
+        with open(out_file, "w") as f:
+            f.write(repr(self.model))
 
         if is_parallel:
             cp_group = None

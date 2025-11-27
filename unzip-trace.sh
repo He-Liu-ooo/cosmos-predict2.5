@@ -1,0 +1,1 @@
+gunzip -c ./outputs/action_conditioned/basic/profiling/torch_trace/action_chunk_iteration_3/rank0_trace.json.gz > ./outputs/action_conditioned/basic/profiling/torch_trace/action_chunk_iteration_3/rank0_trace.json

@@ -14,12 +14,14 @@
 # limitations under the License.
 
 from enum import Enum
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple, Any
 
 import attrs
 import torch
 from megatron.core import parallel_state
 from torch import Tensor
+from cosmos_predict2._src.imaginaire.utils import log
+from dataclasses import fields
 
 from cosmos_predict2._src.predict2.conditioner import DataType
 from cosmos_predict2._src.predict2.configs.video2world.defaults.conditioner import Video2WorldCondition
@@ -89,8 +91,11 @@ class ActionVideo2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         Returns:
             velocity prediction
         """
+        log.debug(f'Denoise called: condition.is_video={condition.is_video}, condition.use_video_condition={condition.use_video_condition}, self.config.denoise_replace_gt_frames={self.config.denoise_replace_gt_frames}')
         if condition.is_video:
+            # set condition.gt_frames same dtype/device as xt_B_C_T_H_W and set the value to condition_state_in_B_C_T_H_W
             condition_state_in_B_C_T_H_W = condition.gt_frames.type_as(xt_B_C_T_H_W)
+            # condition.use_video_condition = True
             if not condition.use_video_condition:
                 # When using random dropout, we zero out the ground truth frames
                 condition_state_in_B_C_T_H_W = condition_state_in_B_C_T_H_W * 0
@@ -99,6 +104,16 @@ class ActionVideo2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
             condition_video_mask = condition.condition_video_input_mask_B_C_T_H_W.repeat(1, C, 1, 1, 1).type_as(
                 xt_B_C_T_H_W
             )
+
+            log.debug(f"condition_state_in_B_C_T_H_W(gt).shape={condition_state_in_B_C_T_H_W.shape}, xt_B_C_T_H_W(noise).shape={xt_B_C_T_H_W.shape}, condition_video_mask.shape={condition_video_mask.shape}")
+            # Count how many ones are in the mask (safe for float/bool masks)
+            try:
+                mask_bool = condition_video_mask.bool()
+                num_ones = int(mask_bool.sum().item())
+                total_elems = condition_video_mask.numel()
+                log.debug(f"condition_video_mask ones={num_ones} / {total_elems} ({num_ones/total_elems:.2%})")
+            except Exception as e:
+                log.warning(f"Failed to count ones in condition_video_mask: {e}")
 
             # Make the first few frames of x_t be the ground truth frames
             xt_B_C_T_H_W = condition_state_in_B_C_T_H_W * condition_video_mask + xt_B_C_T_H_W * (
@@ -111,6 +126,7 @@ class ActionVideo2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
             timesteps_B_T=timesteps_B_T,  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
             **condition.to_dict(),
         ).float()
+        log.debug(f"After net: net_output_B_C_T_H_W.shape={net_output_B_C_T_H_W.shape}")
 
         if condition.is_video and self.config.denoise_replace_gt_frames:
             gt_frames_x0 = condition.gt_frames.type_as(net_output_B_C_T_H_W)
@@ -179,6 +195,65 @@ class ActionVideo2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
 
         _, condition, _, _ = self.broadcast_split_for_model_parallelsim(x0, condition, None, None)
         _, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(x0, uncondition, None, None)
+        
+                # Helper: log only shapes/types for tensors; avoid printing tensor contents
+        def _log_summary(obj_name: str, obj: Any) -> None:
+            try:
+                log.debug(f"{obj_name} type: {type(obj)}")
+                # dict-like
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if isinstance(v, torch.Tensor):
+                            log.debug(f"{obj_name}[{k}] shape={tuple(v.shape)} dtype={v.dtype} device={v.device}")
+                        else:
+                            log.debug(f"{obj_name}[{k}] type={type(v)}")
+                    return
+
+                # dataclass-like or objects exposing to_dict
+                if hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
+                    try:
+                        d = obj.to_dict(skip_underscore=False)
+                    except TypeError:
+                        d = obj.to_dict()
+                    for k, v in d.items():
+                        if isinstance(v, torch.Tensor):
+                            log.debug(f"{obj_name}[{k}] shape={tuple(v.shape)} dtype={v.dtype} device={v.device}")
+                        else:
+                            log.debug(f"{obj_name}[{k}] type={type(v)}")
+                    return
+
+                # dataclass fields (fallback)
+                try:
+                    for f in fields(obj):
+                        v = getattr(obj, f.name)
+                        if isinstance(v, torch.Tensor):
+                            log.debug(f"{obj_name}[{f.name}] shape={tuple(v.shape)} dtype={v.dtype} device={v.device}")
+                        else:
+                            log.debug(f"{obj_name}[{f.name}] type={type(v)}")
+                    return
+                except Exception:
+                    pass
+
+                # generic fallback: list public attrs (no tensor contents)
+                for attr in dir(obj):
+                    if attr.startswith("_"):
+                        continue
+                    try:
+                        v = getattr(obj, attr)
+                    except Exception:
+                        continue
+                    if callable(v):
+                        continue
+                    if isinstance(v, torch.Tensor):
+                        log.debug(f"{obj_name}.{attr} shape={tuple(v.shape)} dtype={v.dtype} device={v.device}")
+                    else:
+                        # skip large reprs
+                        log.debug(f"{obj_name}.{attr} type={type(v)}")
+            except Exception as e:
+                log.warning(f"Failed to print summary for {obj_name}: {e}")
+
+        _log_summary("condition", condition)
+        _log_summary("uncondition", uncondition)
 
         if parallel_state.is_initialized():
             pass
@@ -188,8 +263,11 @@ class ActionVideo2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
             )
 
         def velocity_fn(noise: torch.Tensor, noise_x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+            log.debug(f"Execute velocity_fn: noise.shape={noise.shape}, noise_x.shape={noise_x.shape}, timestep={timestep}")
             cond_v = self.denoise(noise, noise_x, timestep, condition)
+            log.debug(f"After denoise: cond_v.shape={cond_v.shape}")
             uncond_v = self.denoise(noise, noise_x, timestep, uncondition)
+            log.debug(f"After denoise: uncond_v.shape={uncond_v.shape}")
             velocity_pred = cond_v + guidance * (cond_v - uncond_v)
             return velocity_pred
 

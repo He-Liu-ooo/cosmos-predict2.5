@@ -106,7 +106,7 @@ def _init_log_files(output_dir: Path):
     log.logger.add(
         debug_path,
         mode="w",
-        level="DEBUG",
+        level="INFO",
         format=_LOGGER_FORMAT,
         filter=log._rank0_only_filter,
         enqueue=True,

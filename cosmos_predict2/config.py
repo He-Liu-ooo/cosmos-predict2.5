@@ -227,7 +227,7 @@ class CommonSetupArguments(pydantic.BaseModel):
     """Offload guardrail models to CPU to save GPU memory."""
     keep_going: bool = True
     """Keep going if an error occurs."""
-    profile: bool = False
+    profile: bool = True
     """Run profiler and save report to output directory."""
 
     @cached_property

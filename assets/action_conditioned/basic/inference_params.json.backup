@@ -22,16 +22,5 @@
   "action_load_fn": "cosmos_predict2.action_conditioned.load_default_action_fn",
   "negative_prompt": "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, underexposed and overexposed scenes, poor color balance, washed out colors, choppy sequences, jerky movements, low frame rate, artifacting, color banding, unnatural transitions, outdated special effects, fake elements, unconvincing visuals, poorly edited content, jump cuts, visual noise, and flickering. Overall, the video is of poor quality.",
   "seed": 0,
-  "prompt": null,
-
-  "enable_profiling": true,
-  "profile_freq": 3,
-  "profiling_trace_path": "outputs/action_conditioned/basic/profiling",
-  "profiling_record_shape": true,
-  "profiling_profile_memory": true,
-  "profiling_with_stack": true,
-  "profiling_with_modules": true,
-  "profiling_with_flops": true,
-  "profiling_target_ranks": [0]
-
+  "prompt": null
 }

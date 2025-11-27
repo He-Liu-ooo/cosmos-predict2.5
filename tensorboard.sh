@@ -1,0 +1,1 @@
+tensorboard --logdir=./outputs/action_conditioned/basic/profiling/torch_trace/tensorboard_action_chunk_iteration

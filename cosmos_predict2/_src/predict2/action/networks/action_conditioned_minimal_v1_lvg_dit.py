@@ -19,6 +19,7 @@ import torch
 import torch.amp as amp
 import torch.nn as nn
 from einops import rearrange
+import inspect
 
 from cosmos_predict2._src.imaginaire.utils import log
 from cosmos_predict2._src.predict2.conditioner import DataType
@@ -94,7 +95,7 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         del kwargs
-
+        
         if data_type == DataType.VIDEO:
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W.type_as(x_B_C_T_H_W)], dim=1)
         else:
@@ -160,6 +161,7 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
         B, T, H, W, D = x_B_T_H_W_D.shape
 
         intermediate_features_outputs = []
+
         for i, block in enumerate(self.blocks):
             x_B_T_H_W_D = block(
                 x_B_T_H_W_D,
@@ -173,6 +175,7 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
                 x_reshaped_for_disc = rearrange(x_B_T_H_W_D, "b tp hp wp d -> b (tp hp wp) d")
                 intermediate_features_outputs.append(x_reshaped_for_disc)
 
+        x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
         if intermediate_feature_ids:
@@ -215,7 +218,7 @@ class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):
         if self._hidden_dim_in_action_embedder is None:
             self._hidden_dim_in_action_embedder = self.model_channels * 4
 
-        log.info(f"hidden_dim_in_action_embedder: {self._hidden_dim_in_action_embedder}")
+        log.debug(f"hidden_dim_in_action_embedder: {self._hidden_dim_in_action_embedder}")
 
         # add action embedding
         self.action_embedder_B_D = Mlp(
@@ -249,29 +252,62 @@ class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         del kwargs
 
+        log.debug("ActionChunkConditionedMinimalV1LVGDiT forward called...")
+        # Log all input shapes/types/devices before conditioning concat (helpful for debugging)
+        try:
+            def _log_input(name, obj):
+                try:
+                    if isinstance(obj, torch.Tensor):
+                        log.debug(f"{name}: shape={tuple(obj.shape)} dtype={obj.dtype} device={obj.device}")
+                    else:
+                        log.debug(f"{name}: type={type(obj)} value={None if obj is None else getattr(obj, '__class__', str(obj))}")
+                except Exception as _e:
+                    log.warning(f"Failed to log {name}: {_e}")
+
+            _log_input('x_B_C_T_H_W', x_B_C_T_H_W)
+            _log_input('timesteps_B_T', timesteps_B_T)
+            _log_input('crossattn_emb', crossattn_emb)
+            _log_input('condition_video_input_mask_B_C_T_H_W', condition_video_input_mask_B_C_T_H_W)
+            _log_input('fps', fps)
+            _log_input('padding_mask', padding_mask)
+            _log_input('data_type', data_type)
+            _log_input('img_context_emb', img_context_emb)
+            _log_input('action', action)
+        except Exception as e:
+            log.warning(f"Failed to log inputs summary: {e}")
+        log.debug(f"data_type == DataType.VIDEO: {data_type == DataType.VIDEO}, self.use_crossattn_projection={self.use_crossattn_projection}")
+        
         if data_type == DataType.VIDEO:
+            # this branch
             x_B_C_T_H_W = torch.cat([x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W.type_as(x_B_C_T_H_W)], dim=1)
         else:
             B, _, T, H, W = x_B_C_T_H_W.shape
             x_B_C_T_H_W = torch.cat(
                 [x_B_C_T_H_W, torch.zeros((B, 1, T, H, W), dtype=x_B_C_T_H_W.dtype, device=x_B_C_T_H_W.device)], dim=1
             )
-
+        log.debug(f"After concat condition mask: x_B_C_T_H_W.shape={x_B_C_T_H_W.shape}")
+        
         timesteps_B_T = timesteps_B_T * self.timestep_scale
 
         # calculate action embedding
         num_actions = action.shape[1]
         assert action is not None, "action must be provided"
         action = rearrange(action, "b t d -> b 1 (t d)")
+        log.debug(f"self._num_action_per_latent_frame={self._num_action_per_latent_frame}")
         action = rearrange(action, "b 1 (t d) -> b t d", t=num_actions // self._num_action_per_latent_frame)
+        log.debug(f"Before action embedding B_D: action.shape={action.shape}")
         action_emb_B_D = self.action_embedder_B_D(action)
+        log.debug(f"After action embedding B_D: action_emb_B_D.shape={action_emb_B_D.shape}")
         action_emb_B_3D = self.action_embedder_B_3D(action)
+        log.debug(f"After action embedding B_3D: action_emb_B_3D.shape={action_emb_B_3D.shape}")
 
         zero_pad_action_emb_B_D = torch.zeros_like(action_emb_B_D[:, :1, :], device=action_emb_B_D.device)
         zero_pad_action_emb_B_3D = torch.zeros_like(action_emb_B_3D[:, :1, :], device=action_emb_B_3D.device)
 
         action_emb_B_D = torch.cat([zero_pad_action_emb_B_D, action_emb_B_D], dim=1)
+        log.debug(f"After cat: action_emb_B_D.shape={action_emb_B_D.shape}")
         action_emb_B_3D = torch.cat([zero_pad_action_emb_B_3D, action_emb_B_3D], dim=1)
+        log.debug(f"After cat: action_emb_B_3D.shape={action_emb_B_3D.shape}")
 
         assert isinstance(data_type, DataType), (
             f"Expected DataType, got {type(data_type)}. We need discuss this flag later."
@@ -281,9 +317,11 @@ class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):
             fps=fps,
             padding_mask=padding_mask,
         )
+        log.debug(f"After prepare_embedded_sequence: x_B_T_H_W_D.shape={x_B_T_H_W_D.shape}, rope_emb_L_1_1_D.shape={rope_emb_L_1_1_D.shape}")
 
         if self.use_crossattn_projection:
             crossattn_emb = self.crossattn_proj(crossattn_emb)
+            log.debug(f"After crossattn projection: crossattn_emb.shape={crossattn_emb.shape}")
 
         if img_context_emb is not None:
             assert self.extra_image_context_dim is not None, (
@@ -292,17 +330,24 @@ class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):
             img_context_emb = self.img_context_proj(img_context_emb)
             context_input = (crossattn_emb, img_context_emb)
         else:
+            # this branch
             context_input = crossattn_emb
-
+        
+        # TODO
         with amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
             if timesteps_B_T.ndim == 1:
                 timesteps_B_T = timesteps_B_T.unsqueeze(1)
+            log.debug(f"timesteps_B_T.shape={timesteps_B_T.shape}")
             t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
+            log.debug(f"t_embedder output: t_embedding_B_T_D.shape={t_embedding_B_T_D.shape}, adaln_lora_B_T_3D.shape={adaln_lora_B_T_3D.shape}")
 
             t_embedding_B_T_D = t_embedding_B_T_D + action_emb_B_D
+            log.debug(f"After adding action_emb_B_D, t_embedding_B_T_D.shape={t_embedding_B_T_D.shape}")
             adaln_lora_B_T_3D = adaln_lora_B_T_3D + action_emb_B_3D
+            log.debug(f"After adding action_emb_B_3D, adaln_lora_B_T_3D.shape={adaln_lora_B_T_3D.shape}")
 
             t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
+            log.debug(f"After t_embedding_norm, t_embedding_B_T_D.shape={t_embedding_B_T_D.shape}")
 
         # for logging purpose
         affline_scale_log_info = {}
@@ -334,6 +379,7 @@ class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):
 
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
+        
         if intermediate_feature_ids:
             if len(intermediate_features_outputs) != len(intermediate_feature_ids):
                 log.warning(

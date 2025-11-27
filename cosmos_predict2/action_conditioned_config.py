@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, List
 
 from cosmos_predict2.config import (
     DEFAULT_NEGATIVE_PROMPT,
@@ -104,5 +104,44 @@ class ActionConditionedInferenceArguments(CommonInferenceArguments):
     action_load_fn: str = "cosmos_predict2.action_conditioned.load_default_action_fn"
     """A callable that constructs a function which loads action information for a given data sample."""
 
-
+    # Profiling parameters
+    enable_profiling: bool = True
+    """Enable torch profiler for inference runs. When True, profiling will be active and traces
+    will be produced according to `profile_freq` and saved under `profiling_trace_path`.
+    """
+    profile_freq: int = 3
+    """Number of `prof.step()` calls between profiling cycles. The profiler uses a schedule
+    (wait/warmup/active) which is advanced each time `prof.step()` is called — set this value
+    to control how often traces are produced.
+    """
+    profiling_trace_path: Path
+    """Base directory where profiling trace subfolders are written (for example,
+    `<profiling_trace_path>/torch_trace/iteration_<N>`). Ensure this path is writable.
+    """
+    profiling_record_shape: bool = False
+    """If True, the profiler will record the shapes of operator inputs. This can help diagnose
+    performance issues related to input sizes.
+    """
+    profiling_profile_memory: bool = False
+    """If True, the profiler will record CUDA memory allocation and free events. This
+    produces larger traces and increases overhead; enable only when you need memory-level
+    diagnostics.
+    """
+    profiling_with_stack: bool = False
+    """If True, include Python call stacks in the profiling events. Recording stacks
+    substantially increases trace size and runtime overhead — use for short, targeted
+    profiling windows only.
+    """
+    profiling_with_modules: bool = True
+    """If True, aggregate profiler statistics by `nn.Module` (module-level grouping),
+    making it easier to attribute time to submodules. This has modest overhead.
+    """
+    profiling_with_flops: bool = True
+    """If True, aggregate profiler statistics by operation type (FLOPs grouping). This enables
+    analysis of floating point operations performed during inference.
+    """
+    profiling_target_ranks: List[int] = [0]
+    """List of ranks to profile. Only these ranks will save profiling traces.
+    """
+    
 ActionConditionedInferenceOverrides = get_overrides_cls(ActionConditionedInferenceArguments, exclude=["name"])

@@ -16,6 +16,7 @@
 import contextlib
 import os
 import time
+from typing import Optional, Callable
 
 import torch
 
@@ -26,7 +27,8 @@ from cosmos_predict2._src.imaginaire.utils.easy_io import easy_io
 # https://github.com/pytorch/torchtitan/blob/main/torchtitan/profiling.py
 
 # the number of warmup steps before the active step in each profiling cycle
-TORCH_TRACE_WARMUP = 3
+TORCH_TRACE_WARMUP = 1
+# TORCH_TRACE_WARMUP = 3
 
 # how much memory allocation/free ops to record in memory snapshots
 MEMORY_SNAPSHOT_MAX_ENTRIES = 100000
@@ -77,6 +79,75 @@ def maybe_enable_profiling(config, *, global_step: int = 0):
             profile_memory=config.trainer.profiling.profile_memory,
             with_stack=config.trainer.profiling.with_stack,
             with_modules=config.trainer.profiling.with_modules,
+        ) as torch_profiler:
+            torch_profiler.step_num = global_step
+            yield torch_profiler
+    else:
+        torch_profiler = contextlib.nullcontext()
+        yield None
+
+@contextlib.contextmanager
+def maybe_enable_profiling_inference(
+    config,
+    *,
+    global_step: int = 0,
+    trace_handler_kind: str = "chrome",
+    trace_handler_override: Optional[Callable] = None,
+):
+    # get user defined profiler settings
+    enable_profiling = config.enable_profiling
+    profile_freq = config.profile_freq
+
+    if enable_profiling:
+        trace_dir = os.path.join(config.profiling_trace_path, "torch_trace")
+        if distributed.get_rank() == 0:
+            os.makedirs(trace_dir, exist_ok=True)
+
+        rank = distributed.get_rank()
+
+        def trace_handler(prof):
+            curr_trace_dir_name = "chrome_action_chunk_iteration_" + str(prof.step_num)
+            curr_trace_dir = os.path.join(trace_dir, curr_trace_dir_name)
+            if not os.path.exists(curr_trace_dir):
+                os.makedirs(curr_trace_dir, exist_ok=True)
+
+            log.info(f"Dumping traces at step {prof.step_num}")
+            begin = time.monotonic()
+            if rank in config.profiling_target_ranks:
+                prof.export_chrome_trace(f"{curr_trace_dir}/rank{rank}_trace.json.gz")
+            log.info(f"Finished dumping traces in {time.monotonic() - begin:.2f} seconds")
+
+
+        if not os.path.exists(trace_dir):
+            os.makedirs(trace_dir, exist_ok=True)
+
+        warmup, active = TORCH_TRACE_WARMUP, 1
+        wait = profile_freq - (active + warmup)
+        assert wait >= 0, "profile_freq must be greater than or equal to warmup + active"
+        log.info(f"Profiling active (warmup={warmup}, active={active}, wait={wait}). Traces will be saved at {trace_dir}")
+
+        # choose on_trace_ready: prefer explicit override, then built-in tensorboard handler, else chrome json dump
+        if trace_handler_override is not None:
+            on_trace_ready = trace_handler_override
+        elif trace_handler_kind == "tensorboard":
+            tb_logdir = os.path.join(trace_dir, "tensorboard_action_chunk_iteration")
+            os.makedirs(tb_logdir, exist_ok=True)
+            on_trace_ready = torch.profiler.tensorboard_trace_handler(tb_logdir)
+        else:
+            on_trace_ready = trace_handler
+
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active),
+            on_trace_ready=on_trace_ready,
+            record_shapes=config.profiling_record_shape,
+            profile_memory=config.profiling_profile_memory,
+            with_stack=config.profiling_with_stack,
+            with_modules=config.profiling_with_modules,
+            with_flops=config.profiling_with_flops,
         ) as torch_profiler:
             torch_profiler.step_num = global_step
             yield torch_profiler

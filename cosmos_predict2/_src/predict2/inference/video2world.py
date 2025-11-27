@@ -59,6 +59,7 @@ import torch
 import torchvision
 from megatron.core import parallel_state
 from PIL import Image
+import inspect
 
 from cosmos_predict2._src.imaginaire.flags import INTERNAL
 from cosmos_predict2._src.imaginaire.utils import distributed, log
@@ -281,6 +282,21 @@ class Video2WorldInference:
             load_ema_to_reg=True,
             experiment_opts=experiment_opts,
         )
+
+        # Log model class information for debugging / observability
+        try:
+            model_cls = model.__class__
+            src_file = inspect.getsourcefile(model_cls) or "<unknown>"
+            try:
+                _, src_line = inspect.getsourcelines(model_cls)
+            except Exception:
+                src_line = "<unknown>"
+            log.info(
+                f"Video2WorldInference-Loaded model instance: class={model_cls.__module__}.{model_cls.__name__} file={src_file} line={src_line}"
+            )
+        except Exception as e:
+            log.warning(f"Unable to inspect model class: {e}")
+        
         if TYPE_CHECKING:
             from cosmos_predict2._src.predict2.models.video2world_model_rectified_flow import (
                 Video2WorldModelRectifiedFlow,
@@ -343,6 +359,9 @@ class Video2WorldInference:
         Returns:
             dict: A dictionary containing the prepared data batch, moved to the correct device and dtype.
         """
+
+        log.debug(f'Preparing data batch input: video.shape={video.shape}, prompt="{prompt}", num_conditional_frames={num_conditional_frames}, use_neg_prompt={use_neg_prompt}, camera={"None" if camera is None else camera.shape}, action={"None" if action is None else action.shape}')
+
         B, C, T, H, W = video.shape
 
         data_batch = {
@@ -360,6 +379,8 @@ class Video2WorldInference:
 
         # Compute text embeddings
         if self.model.text_encoder is not None:
+            # Log which embedding branch is used for observability
+            log.debug(f"Text embeddings: using model.text_encoder.compute_text_embeddings_online() with use_neg_prompt={use_neg_prompt}")
             data_batch["ai_caption"] = [prompt]
             data_batch["t5_text_embeddings"] = self.model.text_encoder.compute_text_embeddings_online(
                 data_batch={"ai_caption": [prompt], "images": None},
@@ -371,6 +392,8 @@ class Video2WorldInference:
                     input_caption_key="ai_caption",
                 )
         else:
+            # Log fallback branch for text embeddings
+            log.info(f"Text embeddings: model.text_encoder is None, using get_text_embedding() fallback with use_neg_prompt={use_neg_prompt}")
             data_batch["t5_text_embeddings"] = get_text_embedding(prompt)
             if use_neg_prompt:
                 data_batch["neg_t5_text_embeddings"] = get_text_embedding(negative_prompt)
@@ -430,6 +453,27 @@ class Video2WorldInference:
             "expected num_output_video==1 and num_output_video==1 for no camera conditioning or action conditioning"
         )
 
+        # from cosmos_predict2._src.imaginaire.utils import log
+        # import os, threading, torch.distributed as dist
+        # log.info(
+        #     f"DIAG: pid={os.getpid()} thread={threading.get_ident()} dist_initialized={dist.is_available() and dist.is_initialized()} "
+        #     f"rank={dist.get_rank() if dist.is_available() and dist.is_initialized() else 'N/A'}",
+        #     rank0_only=False,
+        # )
+        # with torch.profiler.profile(
+        #     activities=[
+        #         torch.profiler.ProfilerActivity.CPU,
+        #         torch.profiler.ProfilerActivity.CUDA
+        #     ],
+        #     schedule=torch.profiler.schedule(wait=0, warmup=0, active=1),
+        #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./outputs/profiling/ac-conditioned', worker_name='worker0'),
+        #     record_shapes=True,
+        #     profile_memory=True,
+        #     with_stack=True,
+        #     with_flops=True
+        # ) as prof:
+            
+        log.debug("Starting video generation process")
         # Parse resolution string into tuple of integers
         if resolution == "none":
             h, w = self.model.get_video_height_width()
@@ -444,13 +488,16 @@ class Video2WorldInference:
 
         # Determine if input is image or video and process accordingly
         if input_path is None or num_latent_conditional_frames == 0:
+            # Generation-from-scratch branch
+            log.info("Determine if input is image or video and process accordingly: input_path is none or num_latent_conditional_frames==0 -> generating from scratch (empty vid_input)")
             vid_input = torch.zeros(1, 3, model_required_frames, video_resolution[0], video_resolution[1]).to(
                 torch.uint8
             )
         elif isinstance(input_path, str):
             ext = os.path.splitext(input_path)[1].lower()
             if ext in _IMAGE_EXTENSIONS:
-                log.info(f"Processing image input: {input_path}")
+                # Image input branch
+                log.info(f"Determine if input is image or video and process accordingly: image -> Processing image input: {input_path}")
                 vid_input = read_and_process_image(
                     img_path=input_path,
                     resolution=video_resolution,
@@ -458,7 +505,8 @@ class Video2WorldInference:
                     resize=True,
                 )
             elif ext in _VIDEO_EXTENSIONS:
-                log.info(f"Processing video input: {input_path}")
+                # Video input branch
+                log.info(f"Determine if input is image or video and process accordingly: video -> Processing video input: {input_path}")
                 vid_input = read_and_process_video(
                     video_path=input_path,
                     resolution=video_resolution,
@@ -471,6 +519,8 @@ class Video2WorldInference:
                     f"Unsupported file extension: {ext}. Supported extensions: {_IMAGE_EXTENSIONS + _VIDEO_EXTENSIONS}"
                 )
         elif isinstance(input_path, torch.Tensor):
+            # Tensor input branch
+            log.debug("Determine if input is image or video and process accordingly: torch.Tensor input_path provided")
             vid_input = input_path
         else:
             raise ValueError(f"Unsupported input_path type: {type(input_path)}")
@@ -488,7 +538,7 @@ class Video2WorldInference:
         )
 
         mem_bytes = torch.cuda.memory_allocated(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-        log.info(f"GPU memory usage after getting data_batch: {mem_bytes / (1024**3):.2f} GB")
+        log.debug(f"GPU memory usage after getting data_batch: {mem_bytes / (1024**3):.2f} GB")
 
         # Memory Optimization Step 1: Offload Text Encoder
         # Offload text encoder after computing embeddings to free memory
@@ -526,7 +576,7 @@ class Video2WorldInference:
 
         # Generate latent samples using the diffusion model
         # Video should be of shape torch.Size([1, 3, 93, 192, 320]) # Note: Shape check comment
-        log.info("[Memory Optimization] Starting latent sample generation")
+        log.debug("[Memory Optimization] Starting latent sample generation")
         sample = self.model.generate_samples_from_batch(
             data_batch,
             n_sample=1,  # Generate one sample
