@@ -81,6 +81,7 @@ class ActionVideo2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         xt_B_C_T_H_W: torch.Tensor,
         timesteps_B_T: torch.Tensor,
         condition: Text2WorldCondition,
+        use_cuda_graph: bool = False,
     ) -> DenoisePrediction:
         """
         Args:
@@ -91,7 +92,10 @@ class ActionVideo2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         Returns:
             velocity prediction
         """
+        
         log.debug(f'Denoise called: condition.is_video={condition.is_video}, condition.use_video_condition={condition.use_video_condition}, self.config.denoise_replace_gt_frames={self.config.denoise_replace_gt_frames}')
+        
+        
         if condition.is_video:
             # set condition.gt_frames same dtype/device as xt_B_C_T_H_W and set the value to condition_state_in_B_C_T_H_W
             condition_state_in_B_C_T_H_W = condition.gt_frames.type_as(xt_B_C_T_H_W)
@@ -106,27 +110,118 @@ class ActionVideo2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
             )
 
             log.debug(f"condition_state_in_B_C_T_H_W(gt).shape={condition_state_in_B_C_T_H_W.shape}, xt_B_C_T_H_W(noise).shape={xt_B_C_T_H_W.shape}, condition_video_mask.shape={condition_video_mask.shape}")
-            # Count how many ones are in the mask (safe for float/bool masks)
-            try:
-                mask_bool = condition_video_mask.bool()
-                num_ones = int(mask_bool.sum().item())
-                total_elems = condition_video_mask.numel()
-                log.debug(f"condition_video_mask ones={num_ones} / {total_elems} ({num_ones/total_elems:.2%})")
-            except Exception as e:
-                log.warning(f"Failed to count ones in condition_video_mask: {e}")
-
             # Make the first few frames of x_t be the ground truth frames
             xt_B_C_T_H_W = condition_state_in_B_C_T_H_W * condition_video_mask + xt_B_C_T_H_W * (
                 1 - condition_video_mask
             )
 
-        # forward pass through the network
-        net_output_B_C_T_H_W = self.net(
-            x_B_C_T_H_W=xt_B_C_T_H_W.to(**self.tensor_kwargs),  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
-            timesteps_B_T=timesteps_B_T,  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
-            **condition.to_dict(),
-        ).float()
-        log.debug(f"After net: net_output_B_C_T_H_W.shape={net_output_B_C_T_H_W.shape}")
+        # Forward pass through the network. If requested, attempt a guarded
+        # CUDA Graph capture/replay to accelerate repeated inference. The
+        # capture is performed once (warmup) and replayed for subsequent
+        # calls. Any exception during capture/replay falls back to a normal
+        # forward to remain robust.
+        if use_cuda_graph and torch.cuda.is_available():
+            # Prepare inputs on correct device/dtype
+            inputs: dict = {}
+            inputs["x_B_C_T_H_W"] = xt_B_C_T_H_W.to(**self.tensor_kwargs)
+            inputs["timesteps_B_T"] = timesteps_B_T.to(device=self.tensor_kwargs["device"])
+
+            cond_dict = condition.to_dict()
+            # Separate tensor and non-tensor condition entries
+            non_tensor_inputs: dict = {}
+            for k, v in cond_dict.items():
+                if isinstance(v, torch.Tensor):
+                    inputs[k] = v.to(**self.tensor_kwargs)
+                else:
+                    non_tensor_inputs[k] = v
+
+            # Diagnostic: log non-tensor condition keys/types before capture
+            try:
+                if non_tensor_inputs:
+                    log.warning(f"Non-tensor condition entries present before CUDAGraph capture: {list(non_tensor_inputs.keys())}")
+            except Exception:
+                pass
+
+            cg_state = getattr(self, "_cuda_graph_state_action", None)
+            try:
+                if not cg_state or not cg_state.get("captured", False):
+                    # Warmup forward to allocate any lazy buffers and determine shapes
+                    warm_out = self.net(**{**inputs, **non_tensor_inputs}).float()
+
+                    # Preallocate static buffers matching warmup shapes on CUDA
+                    static_inputs: dict = {}
+                    static_inputs["x_B_C_T_H_W"] = torch.empty_like(inputs["x_B_C_T_H_W"], device=self.tensor_kwargs["device"], dtype=inputs["x_B_C_T_H_W"].dtype)
+                    static_inputs["timesteps_B_T"] = torch.empty_like(inputs["timesteps_B_T"], device=self.tensor_kwargs["device"], dtype=inputs["timesteps_B_T"].dtype)
+                    for k, v in inputs.items():
+                        if k in ("x_B_C_T_H_W", "timesteps_B_T"):
+                            continue
+                        static_inputs[k] = torch.empty_like(v, device=self.tensor_kwargs["device"], dtype=v.dtype)
+
+                    static_out = torch.empty_like(warm_out, device=self.tensor_kwargs["device"], dtype=warm_out.dtype)
+
+                    # Copy initial values into static buffers
+                    static_inputs["x_B_C_T_H_W"].copy_(inputs["x_B_C_T_H_W"])
+                    static_inputs["timesteps_B_T"].copy_(inputs["timesteps_B_T"])
+                    for k in list(static_inputs.keys()):
+                        if k in ("x_B_C_T_H_W", "timesteps_B_T"):
+                            continue
+                        static_inputs[k].copy_(inputs[k])
+
+                    # Capture graph. Synchronize first to ensure there are no
+                    # outstanding CUDA ops on the default stream (a common
+                    # cause of CUDAGraph capture failures).
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        # Best-effort; continue and rely on the outer try/except
+                        pass
+
+                    # Capture into a new CUDAGraph using explicit capture API
+                    # (some PyTorch builds do not implement CUDAGraph as a
+                    # context manager, causing `__enter__` AttributeError).
+                    g = torch.cuda.CUDAGraph()
+                    # Use explicit capture_begin()/capture_end() for maximum
+                    # compatibility across PyTorch versions.
+                    g.capture_begin()
+                    out = self.net(**{**static_inputs, **non_tensor_inputs})
+                    static_out.copy_(out)
+                    g.capture_end()
+
+                    self._cuda_graph_state_action = {
+                        "captured": True,
+                        "graph": g,
+                        "static_inputs": static_inputs,
+                        "static_output": static_out,
+                        "non_tensor_inputs": non_tensor_inputs,
+                    }
+                    net_output_B_C_T_H_W = static_out
+                else:
+                    # Replay: copy the new inputs into static buffers, then replay
+                    static_inputs = cg_state["static_inputs"]
+                    static_inputs["x_B_C_T_H_W"].copy_(inputs["x_B_C_T_H_W"])
+                    static_inputs["timesteps_B_T"].copy_(inputs["timesteps_B_T"])
+                    for k in list(static_inputs.keys()):
+                        if k in ("x_B_C_T_H_W", "timesteps_B_T"):
+                            continue
+                        static_inputs[k].copy_(inputs[k])
+
+                    cg_state["graph"].replay()
+                    net_output_B_C_T_H_W = cg_state["static_output"]
+            except Exception as e:
+                import traceback
+
+                tb = traceback.format_exc()
+                # Include the traceback in the warning so it's visible in default logs
+                log.warning(
+                    "CUDAGraph capture/replay failed (%s); falling back to normal forward. Traceback:\n%s" % (e, tb)
+                )
+                net_output_B_C_T_H_W = self.net(**{**inputs, **non_tensor_inputs}).float()
+        else:
+            net_output_B_C_T_H_W = self.net(
+                x_B_C_T_H_W=xt_B_C_T_H_W.to(**self.tensor_kwargs),  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
+                timesteps_B_T=timesteps_B_T,  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
+                **condition.to_dict(),
+            ).float()
 
         if condition.is_video and self.config.denoise_replace_gt_frames:
             gt_frames_x0 = condition.gt_frames.type_as(net_output_B_C_T_H_W)
@@ -262,11 +357,11 @@ class ActionVideo2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
                 "parallel_state is not initialized, context parallel should be turned off."
             )
 
-        def velocity_fn(noise: torch.Tensor, noise_x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        def velocity_fn(noise: torch.Tensor, noise_x: torch.Tensor, timestep: torch.Tensor, use_cuda_graph: bool) -> torch.Tensor:
             log.debug(f"Execute velocity_fn: noise.shape={noise.shape}, noise_x.shape={noise_x.shape}, timestep={timestep}")
-            cond_v = self.denoise(noise, noise_x, timestep, condition)
+            cond_v = self.denoise(noise, noise_x, timestep, condition, use_cuda_graph)
             log.debug(f"After denoise: cond_v.shape={cond_v.shape}")
-            uncond_v = self.denoise(noise, noise_x, timestep, uncondition)
+            uncond_v = self.denoise(noise, noise_x, timestep, uncondition, use_cuda_graph)
             log.debug(f"After denoise: uncond_v.shape={uncond_v.shape}")
             velocity_pred = cond_v + guidance * (cond_v - uncond_v)
             return velocity_pred

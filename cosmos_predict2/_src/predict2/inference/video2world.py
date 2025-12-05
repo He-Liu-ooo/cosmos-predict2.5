@@ -393,7 +393,7 @@ class Video2WorldInference:
                 )
         else:
             # Log fallback branch for text embeddings
-            log.info(f"Text embeddings: model.text_encoder is None, using get_text_embedding() fallback with use_neg_prompt={use_neg_prompt}")
+            log.debug(f"Text embeddings: model.text_encoder is None, using get_text_embedding() fallback with use_neg_prompt={use_neg_prompt}")
             data_batch["t5_text_embeddings"] = get_text_embedding(prompt)
             if use_neg_prompt:
                 data_batch["neg_t5_text_embeddings"] = get_text_embedding(negative_prompt)
@@ -423,6 +423,7 @@ class Video2WorldInference:
         offload_diffusion_model: bool = False,
         offload_text_encoder: bool = False,
         offload_tokenizer: bool = False,
+        use_cuda_graph: bool = False,
     ):
         """
         Generates a video based on an input image or video and text prompt.
@@ -453,27 +454,6 @@ class Video2WorldInference:
             "expected num_output_video==1 and num_output_video==1 for no camera conditioning or action conditioning"
         )
 
-        # from cosmos_predict2._src.imaginaire.utils import log
-        # import os, threading, torch.distributed as dist
-        # log.info(
-        #     f"DIAG: pid={os.getpid()} thread={threading.get_ident()} dist_initialized={dist.is_available() and dist.is_initialized()} "
-        #     f"rank={dist.get_rank() if dist.is_available() and dist.is_initialized() else 'N/A'}",
-        #     rank0_only=False,
-        # )
-        # with torch.profiler.profile(
-        #     activities=[
-        #         torch.profiler.ProfilerActivity.CPU,
-        #         torch.profiler.ProfilerActivity.CUDA
-        #     ],
-        #     schedule=torch.profiler.schedule(wait=0, warmup=0, active=1),
-        #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./outputs/profiling/ac-conditioned', worker_name='worker0'),
-        #     record_shapes=True,
-        #     profile_memory=True,
-        #     with_stack=True,
-        #     with_flops=True
-        # ) as prof:
-            
-        log.debug("Starting video generation process")
         # Parse resolution string into tuple of integers
         if resolution == "none":
             h, w = self.model.get_video_height_width()
@@ -538,7 +518,7 @@ class Video2WorldInference:
         )
 
         mem_bytes = torch.cuda.memory_allocated(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-        log.debug(f"GPU memory usage after getting data_batch: {mem_bytes / (1024**3):.2f} GB")
+        log.info(f"GPU memory usage after getting data_batch: {mem_bytes / (1024**3):.2f} GB")
 
         # Memory Optimization Step 1: Offload Text Encoder
         # Offload text encoder after computing embeddings to free memory
@@ -577,6 +557,7 @@ class Video2WorldInference:
         # Generate latent samples using the diffusion model
         # Video should be of shape torch.Size([1, 3, 93, 192, 320]) # Note: Shape check comment
         log.debug("[Memory Optimization] Starting latent sample generation")
+        
         sample = self.model.generate_samples_from_batch(
             data_batch,
             n_sample=1,  # Generate one sample
@@ -584,6 +565,7 @@ class Video2WorldInference:
             seed=seed,  # Fixed seed for reproducibility
             is_negative_prompt=True,  # Use classifier-free guidance
             num_steps=num_steps,
+            use_cuda_graph=use_cuda_graph,
             **extra_kwargs,
         )
 

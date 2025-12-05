@@ -58,6 +58,8 @@ from cosmos_predict2._src.predict2.utils.dtensor_helper import (
     broadcast_dtensor_model_states,
 )
 
+from cosmos_predict2._src.imaginaire.utils.profiling import CURRENT_DENOISE_STEP
+
 IS_PREPROCESSED_KEY = "is_preprocessed"
 
 
@@ -137,53 +139,6 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
         # 3. tokenizer
         with misc.timer("DiffusionModel: set_up_tokenizer"):
             self.tokenizer: BaseVAE = lazy_instantiate(config.tokenizer)
-            
-            # import os
-            # out_dir = os.path.abspath(os.path.join(os.getcwd(), "outputs", "network_arch"))
-            # os.makedirs(out_dir, exist_ok=True)
-            # out_file = os.path.join(out_dir, "video_tokenizer.md")
-
-            # def _describe_tokenizer(obj) -> str:
-            #     """Return a compact, human-friendly description of the tokenizer object.
-
-            #     Avoids calling heavy methods and is defensive against attributes that may raise.
-            #     """
-            #     lines: list[str] = []
-            #     cls = obj.__class__
-            #     lines.append(f"class: {cls.__module__}.{cls.__name__}")
-            #     try:
-            #         src = inspect.getsourcefile(cls) or "<unknown>"
-            #         sl = inspect.getsourcelines(cls)[1]
-            #         lines.append(f"defined in: {src}:{sl}")
-            #     except Exception:
-            #         lines.append("defined in: <unknown>")
-
-            #     # Safe introspection of a few useful attributes commonly present on VAEs
-            #     for a in ("latent_ch", "spatial_compression_factor", "latent_num_frames"):
-            #         if hasattr(obj, a):
-            #             try:
-            #                 lines.append(f"{a}: {getattr(obj, a)!r}")
-            #             except Exception:
-            #                 lines.append(f"{a}: <unreadable>")
-
-            #     # List a lightweight set of callable methods (avoid retrieving callables that may be heavy)
-            #     methods: list[str] = []
-            #     for name in dir(obj):
-            #         if name.startswith("_"):
-            #             continue
-            #         if name in ("encode", "decode", "get_latent_num_frames", "reset_dtype"):
-            #             methods.append(name)
-            #     lines.append("callable methods: " + ", ".join(sorted(methods)))
-
-            #     return "\n".join(lines)
-
-            # try:
-            #     with open(out_file, "w") as f:
-            #         f.write(_describe_tokenizer(self.tokenizer))
-            # except Exception:
-            #     # Fallback to safe repr if anything goes wrong writing the friendly description
-            #     with open(out_file, "w") as f:
-            #         f.write(repr(self.tokenizer))
                 
             assert self.tokenizer.latent_ch == self.config.state_ch, (
                 f"latent_ch {self.tokenizer.latent_ch} != state_shape {self.config.state_ch}"
@@ -573,6 +528,7 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
         is_negative_prompt: bool = False,
         num_steps: int = 35,
         shift: float = 5.0,
+        use_cuda_graph: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -588,7 +544,7 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
             num_steps (int): number of steps for the diffusion process
         """
         
-        num_steps = 2
+        # num_steps = 2
         
         self._normalize_video_databatch_inplace(data_batch)
         self._augment_image_dim_inplace(data_batch)
@@ -634,13 +590,19 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
         else:
             timesteps_iter = tqdm.tqdm(timesteps, desc="Generating samples", total=len(timesteps))
         for _, t in enumerate(timesteps_iter):
+            token = CURRENT_DENOISE_STEP.set(int(t.item()))
+            
             latent_model_input = latents
             timestep = [t]
 
             timestep = torch.stack(timestep)
     
             log.debug(f"Entering velocity_fn: noise.shape={noise.shape}, latent_model_input.shape={latent_model_input.shape}, timestep.shape={timestep.unsqueeze(0).shape}")
-            velocity_pred = velocity_fn(noise, latent_model_input, timestep.unsqueeze(0))
+            try:
+                velocity_pred = velocity_fn(noise, latent_model_input, timestep.unsqueeze(0), use_cuda_graph)
+            finally:
+                CURRENT_DENOISE_STEP.reset(token)
+
             log.debug(f"Exiting velocity_fn: velocity_pred.shape={velocity_pred.shape}")
             temp_x0 = self.sample_scheduler.step(
                 velocity_pred.unsqueeze(0), t, latents[0].unsqueeze(0), return_dict=False, generator=seed_g

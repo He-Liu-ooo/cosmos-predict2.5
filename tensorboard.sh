@@ -1,1 +1,1 @@
-tensorboard --logdir=./outputs/action_conditioned/basic/profiling/torch_trace/tensorboard_action_chunk_iteration
+tensorboard --logdir=./outputs/action_conditioned/torch_profiler/torch_profiler/torch_trace/tensorboard_action_chunk_iteration

@@ -1,4 +1,17 @@
 # HACKING
+
+## Run
+```
+# launch docker
+./run-docker.sh
+
+# enter virtual env
+source .venv/bin/activate
+
+# run
+./run.sh output_subdir_name
+```
+
 ## Verbose
 
 Check the container mounts:
@@ -81,6 +94,59 @@ outputs/action_conditioned/basic/profiling/torch_trace/action_chunk_iteration_3/
 
 Steps to view a torch.profiler trace:
 
-1. Decompress the trace (project includes `unzip-trace.sh` for convenience).
-2. Download the decompressed trace file to your local machine (if the container cannot open it directly).
-3. Open https://ui.perfetto.dev/ in your browser and load the trace file.
+1. run `unzip-trace.sh` to unzip a trace if neccessary
+2. run `tensorboard.sh` to unzip a browser
+
+
+### torch.cuda.Event
+
+Use lightweight GPU events to collect accurate, low-overhead timings without repeatedly blocking the device. Key recommendations:
+
+- Lightweight events: Only create `torch.cuda.Event` start/end pairs on the GPU. Do not call `torch.cuda.synchronize()` or compute elapsed times at every `stop()` — those calls block the GPU and distort latency measurements.
+
+- Buffer metadata: Record start/end events together with metadata (for example: `action_chunk`, `denoise_step`/`step`, `block`, `layer`, `rank`) into an in-memory buffer instead of writing immediately.
+
+- Attach via hooks: Register instrumentation hooks at the outer inference driver and forward timers into deep submodules. This lets you register timers once per sampling session and avoids repeated hook setup.
+
+- Batch synchronization and write: At well-defined safe points (for example, the end of each action chunk, after every N timers, or at process exit) call `torch.cuda.synchronize()` once, compute elapsed times for all paired events in the buffer, then write the numeric results to disk in bulk (JSONL or CSV). Batching amortizes the synchronization cost and prevents repeated GPU stalls.
+
+- Non-blocking IO: Perform disk writes from a background thread or asynchronously (or at minimum, append in reasonably sized batches). Write per-rank files to avoid concurrent-write conflicts and merge them offline when needed.
+
+Example sketch (conceptual, not production-ready):
+
+```py
+# buffer events and metadata
+event_buffer = []  # list of (start_event, end_event, metadata)
+
+# when instrumenting:
+start = torch.cuda.Event(enable_timing=True)
+end = torch.cuda.Event(enable_timing=True)
+start.record()
+# ... run op ...
+end.record()
+event_buffer.append((start, end, metadata_dict))
+
+# at safe point:
+torch.cuda.synchronize()
+results = []
+for s, e, meta in event_buffer:
+    ms = s.elapsed_time(e)
+    meta['elapsed_ms'] = float(ms)
+    results.append(meta)
+
+# write results in bulk (JSONL/CSV) from a background thread
+```
+
+Files and locations updated for this instrumentation:
+
+```
+cosmos_predict2/_src/imaginaire/utils/profiling.py
+cosmos_predict2/_src/predict2/models/text2world_model_rectified_flow.py
+cosmos_predict2/action_conditioned.py
+```
+
+How to enable: set `enable_torch_cuda_event` to `True` in your `inference_params.json`.
+How to plot: use `scripts/plot_torch_cuda_event_breakdown.py`.
+
+## CUDA Graph
+CUDA Graph support is experimental and not fully implemented. Do not enable `enable_cuda_graph` in `assets/action_conditioned/basic/inference_params.json` — setting it to `true` will likely cause the model to fail at runtime.

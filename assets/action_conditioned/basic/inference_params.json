@@ -2,7 +2,7 @@
   "name": "basic",
   "input_root": "assets/action_conditioned/basic/bridge",
   "input_json_sub_folder": "annotation/test",
-  "save_root": "outputs/action_conditioned/basic",
+  "save_root": "outputs/action_conditioned/cuda_graph",
   "guidance": 0,
   "resolution": "256,320",
   "camera_id": 0,
@@ -24,14 +24,19 @@
   "seed": 0,
   "prompt": null,
 
-  "enable_profiling": true,
+  "enable_torch_profiler": true,
   "profile_freq": 3,
-  "profiling_trace_path": "outputs/action_conditioned/basic/profiling",
+  "profiling_trace_path": "outputs/action_conditioned/cuda_graph/torch_profiler",
   "profiling_record_shape": true,
   "profiling_profile_memory": true,
   "profiling_with_stack": true,
   "profiling_with_modules": true,
   "profiling_with_flops": true,
-  "profiling_target_ranks": [0]
+  "profiling_target_ranks": [0],
+  
+  "enable_cuda_graph": false,
+  
+  "enable_torch_cuda_event": false,
+  "torch_cuda_event_output_path": "outputs/action_conditioned/cuda_graph/torch_cuda_event"
 
 }

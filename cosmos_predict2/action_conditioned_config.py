@@ -105,15 +105,10 @@ class ActionConditionedInferenceArguments(CommonInferenceArguments):
     """A callable that constructs a function which loads action information for a given data sample."""
 
     # Profiling parameters
-    enable_profiling: bool = True
-    """Enable torch profiler for inference runs. When True, profiling will be active and traces
-    will be produced according to `profile_freq` and saved under `profiling_trace_path`.
-    """
-    profile_freq: int = 3
-    """Number of `prof.step()` calls between profiling cycles. The profiler uses a schedule
-    (wait/warmup/active) which is advanced each time `prof.step()` is called — set this value
-    to control how often traces are produced.
-    """
+    enable_torch_profiler: bool = False
+    """Enable PyTorch profiler."""
+    profile_freq: int = 10
+    """Frequency (in iterations) at which to run the profiler."""
     profiling_trace_path: Path
     """Base directory where profiling trace subfolders are written (for example,
     `<profiling_trace_path>/torch_trace/iteration_<N>`). Ensure this path is writable.
@@ -144,4 +139,16 @@ class ActionConditionedInferenceArguments(CommonInferenceArguments):
     """List of ranks to profile. Only these ranks will save profiling traces.
     """
     
+    enable_cuda_graph: bool = False
+    """Enable CUDA Graphs for inference to improve performance.
+    """
+    
+    enable_torch_cuda_event: bool = False
+    """Enable torch.cuda.Event for more detailed timing information.
+    """
+    torch_cuda_event_output_path: Path
+    """Path to save torch.cuda.Event timing information.
+    """
+    
+
 ActionConditionedInferenceOverrides = get_overrides_cls(ActionConditionedInferenceArguments, exclude=["name"])
